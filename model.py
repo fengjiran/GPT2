@@ -1,9 +1,11 @@
 import math
 from dataclasses import dataclass
+from typing import Tuple, Any, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 
 
 @dataclass
@@ -61,7 +63,29 @@ class CausalSelfAttention(nn.Module):
         B, N, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        query, key, value = self.c_attn(x).split(self.n_embd, dim = 2)
+        query, key, value = self.c_attn(x).split(self.n_embd, dim=2)
+        # (B, n_head, N, head_dim)
+        query = query.view(B, N, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+        key = key.view(B, N, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+        value = value.view(B, N, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True
+            )
+        else:
+            # manual implementation of attention
+            attn = (query @ key.transpose(-2, -1)) * (1.0 / math.sqrt(query.size(-1)))
+            attn = attn.masked_fill(self.bias[:, :, :N, :N] == 0, float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            y = attn @ value
+
+        y = y.transpose(1, 2).contiguous().view(B, N, self.n_embd)
+        y = self.residual_dropout(self.c_proj(y))
+        return y
 
 
 class MLP(nn.Module):
@@ -79,6 +103,103 @@ class MLP(nn.Module):
         return self.dropout(x)
 
 
+class Block(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super(Block, self).__init__()
+        self.ln_1 = LayerNorm(config.n_embd, config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super(GPT, self).__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
+
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wpe=nn.Embedding(config.n_embd, config.n_embd),
+                dropout=nn.Dropout(config.dropout),
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f=LayerNorm(config.n_embd, config.bias)
+            )
+        )
+
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for name, param in self.named_parameters():
+            if name.endswith("c_proj.weight"):
+                torch.nn.init.normal_(param, mean=0, std=0.02 / math.sqrt(2 * config.n_layer))
+
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+
+    def forward(self, idx: torch.Tensor, targets=None) -> Tuple[Any, Optional[Tensor]]:
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, \
+            f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, device=device)
+
+        token_embed = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_embed = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        x = self.transformer.dropout(token_embed + pos_embed)
+
+        for block in self.transformer.h:
+            x = block(x)
+
+        x = self.transformer.ln_f(x)
+        if targets is not None:
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
+        return logits, loss
+
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_nums = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_nums -= self.transformer.wpe.weight.numel()
+        return n_nums
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
+
+    def crop_block_size(self, block_size):
+        """
+        model surgery to decrease the block size if necessary.
+        e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+        but want to use a smaller block size for some smaller, simpler model
+        """
+        assert block_size <= self.config.block_size
+
+
 if __name__ == "__main__":
     # N, C, H, W = 20, 3, 10, 10
     # input = torch.randn(N, C, H, W)
@@ -92,4 +213,10 @@ if __name__ == "__main__":
     assert output.is_contiguous()
 
     q, k, v = output.split(64, dim=-1)
+    q1 = q.view(10, 5, 4, 16).transpose(1, 2)
+    print(q1.is_contiguous())
+    print(q.untyped_storage().data_ptr() == q1.untyped_storage().data_ptr())
+    print(hasattr(torch.nn.functional, "scaled_dot_product_attention"))
+
+    gpt2 = GPT(GPTConfig())
     print('done')
