@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+import inspect
 from typing import Tuple, Any, Optional
 
 import torch
@@ -125,13 +126,12 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                wpe=nn.Embedding(config.block_size, config.n_embd),
-                dropout=nn.Dropout(config.dropout),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f=LayerNorm(config.n_embd, config.bias)
-            )
+            dict(wte=nn.Embedding(config.vocab_size, config.n_embd),
+                 wpe=nn.Embedding(config.block_size, config.n_embd),
+                 dropout=nn.Dropout(config.dropout),
+                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                 ln_f=LayerNorm(config.n_embd, config.bias)
+                 )
         )
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -198,6 +198,13 @@ class GPT(nn.Module):
         but want to use a smaller block size for some smaller, simpler model
         """
         assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        for block in self.transformer.h:
+            if hasattr(block.attn, "bias"):
+                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        pass
 
 
 if __name__ == "__main__":
@@ -219,4 +226,5 @@ if __name__ == "__main__":
     print(hasattr(torch.nn.functional, "scaled_dot_product_attention"))
 
     gpt2 = GPT(GPTConfig())
+    gpt2.crop_block_size(1024)
     print('done')
