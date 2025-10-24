@@ -251,4 +251,5 @@ if __name__ == "__main__":
 
     gpt2 = GPT(GPTConfig())
     gpt2.crop_block_size(1024)
+
     print('done')
