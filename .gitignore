@@ -134,3 +134,5 @@ dmypy.json
 cmake-build-debug/
 .DS_Store
 *.txt
+*.bin
+*.pkl

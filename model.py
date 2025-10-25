@@ -51,7 +51,7 @@ class CausalSelfAttention(nn.Module):
         self.residual_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -249,7 +249,16 @@ if __name__ == "__main__":
     print(q.untyped_storage().data_ptr() == q1.untyped_storage().data_ptr())
     print(hasattr(torch.nn.functional, "scaled_dot_product_attention"))
 
-    gpt2 = GPT(GPTConfig())
-    gpt2.crop_block_size(1024)
+    config = GPTConfig()
+    batch_size = 10
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x = torch.randint(50304, (batch_size, config.block_size), device=device)
+    y = torch.randint(50304, (batch_size, config.block_size), device=device)
+
+    gpt2 = GPT(config).to(device)
+    # gpt2.crop_block_size(1024)
+
+    logits, loss = gpt2(x, y)
 
     print('done')
+    print(torch.cuda.is_bf16_supported())
