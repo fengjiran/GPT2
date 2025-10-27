@@ -11,7 +11,7 @@ from torch import Tensor
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    block_size: int = 1024  # sequence length
     vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
@@ -51,6 +51,7 @@ class CausalSelfAttention(nn.Module):
         self.residual_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         if not self.flash:
@@ -61,14 +62,14 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # batch size, sequence length, embedding dimensionality (n_embd)
-        B, N, C = x.size()
+        bs, seq_len, dim = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         query, key, value = self.c_attn(x).split(self.n_embd, dim=2)
         # (B, n_head, N, head_dim)
-        query = query.view(B, N, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
-        key = key.view(B, N, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
-        value = value.view(B, N, self.n_head, self.n_embd // self.n_head).transpose(1, 2)
+        query = query.view(bs, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        key = key.view(bs, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        value = value.view(bs, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(
@@ -79,12 +80,12 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             attn = (query @ key.transpose(-2, -1)) * (1.0 / math.sqrt(query.size(-1)))
-            attn = attn.masked_fill(self.bias[:, :, :N, :N] == 0, float("-inf"))
+            attn = attn.masked_fill(self.bias[:, :, :seq_len, :seq_len] == 0, float("-inf"))
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
             y = attn @ value
 
-        y = y.transpose(1, 2).contiguous().view(B, N, self.n_embd)
+        y = y.transpose(1, 2).contiguous().view(bs, seq_len, self.n_embd)
         y = self.residual_dropout(self.c_proj(y))
         return y
 
@@ -148,11 +149,11 @@ class GPT(nn.Module):
         print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def forward(self, idx: torch.Tensor, targets=None) -> Tuple[Any, Optional[Tensor]]:
-        device = idx.device
+        dev = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, \
             f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, device=device)
+        pos = torch.arange(0, t, device=dev)
 
         token_embed = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_embed = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
