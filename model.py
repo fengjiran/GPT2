@@ -30,12 +30,13 @@ class LayerNorm(nn.Module):
         super(LayerNorm, self).__init__()
         self.gamma = nn.Parameter(torch.ones(ndim))
         self.beta = nn.Parameter(torch.zeros(ndim)) if bias else None
-        self.gelu = nn.GELU()
+        # self.gelu = nn.GELU()
 
     def forward(self, x) -> torch.Tensor:
         return F.layer_norm(x, self.gamma.shape, self.gamma, self.beta, 1e-5)
 
 
+# MHA
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: GPTConfig):
         super(CausalSelfAttention, self).__init__()
@@ -108,13 +109,15 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: GPTConfig):
         super(Block, self).__init__()
-        self.ln_1 = LayerNorm(config.n_embd, config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, config.bias)
+        # self.ln_1 = LayerNorm(config.n_embd, config.bias)
+        self.mha = CausalSelfAttention(config)
+        # self.ln_2 = LayerNorm(config.n_embd, config.bias)
         self.mlp = MLP(config)
+        self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
 
     def forward(self, x) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
+        x = x + self.mha(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -131,7 +134,7 @@ class GPT(nn.Module):
                  wpe=nn.Embedding(config.block_size, config.n_embd),
                  dropout=nn.Dropout(config.dropout),
                  h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                 ln_f=LayerNorm(config.n_embd, config.bias)
+                 ln_f=nn.LayerNorm(config.n_embd, bias=config.bias)
                  )
         )
 
@@ -150,13 +153,13 @@ class GPT(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets=None) -> Tuple[Any, Optional[Tensor]]:
         dev = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, \
-            f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, device=dev)
+        bs, seq_len = idx.size()
+        assert seq_len <= self.config.block_size, \
+            f"Cannot forward sequence of length {seq_len}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, seq_len, device=dev)
 
-        token_embed = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_embed = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        token_embed = self.transformer.wte(idx)  # token embeddings of shape (bs, seq_len, n_embd)
+        pos_embed = self.transformer.wpe(pos)  # position embeddings of shape (seq_len, n_embd)
         x = self.transformer.dropout(token_embed + pos_embed)
 
         for block in self.transformer.h:
@@ -201,8 +204,8 @@ class GPT(nn.Module):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         for block in self.transformer.h:
-            if hasattr(block.attn, "bias"):
-                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+            if hasattr(block.mha, "bias"):
+                block.mha.bias = block.mha.bias[:, :, :block_size, :block_size]
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all the candidate parameters
@@ -246,20 +249,19 @@ if __name__ == "__main__":
 
     q, k, v = output.split(64, dim=-1)
     q1 = q.view(10, 5, 4, 16).transpose(1, 2)
-    print(q1.is_contiguous())
-    print(q.untyped_storage().data_ptr() == q1.untyped_storage().data_ptr())
-    print(hasattr(torch.nn.functional, "scaled_dot_product_attention"))
+    assert q1.is_contiguous() is False
+    assert q.untyped_storage().data_ptr() == q1.untyped_storage().data_ptr()
+    assert hasattr(torch.nn.functional, "scaled_dot_product_attention")
+    assert torch.cuda.is_bf16_supported()
 
     config = GPTConfig()
     batch_size = 10
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    x = torch.randint(50304, (batch_size, config.block_size), device=device)
-    y = torch.randint(50304, (batch_size, config.block_size), device=device)
+    x = torch.randint(config.vocab_size, (batch_size, config.block_size), device=device)
+    y = torch.randint(config.vocab_size, (batch_size, config.block_size), device=device)
 
     gpt2 = GPT(config).to(device)
     # gpt2.crop_block_size(1024)
 
     logits, loss = gpt2(x, y)
-
     print('done')
-    print(torch.cuda.is_bf16_supported())
