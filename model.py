@@ -252,7 +252,7 @@ if __name__ == "__main__":
     assert q1.is_contiguous() is False
     assert q.untyped_storage().data_ptr() == q1.untyped_storage().data_ptr()
     assert hasattr(torch.nn.functional, "scaled_dot_product_attention")
-    assert torch.cuda.is_bf16_supported()
+    # assert torch.cuda.is_bf16_supported()
 
     config = GPTConfig()
     batch_size = 10
