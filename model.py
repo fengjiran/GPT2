@@ -61,16 +61,23 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache=None):
         # batch size, sequence length, embedding dimensionality (n_embd)
         bs, seq_len, dim = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         query, key, value = self.c_attn(x).split(self.n_embd, dim=2)
-        # (B, n_head, N, head_dim)
+        if cache is not None:
+            pk, pv = cache
+            key = torch.concat([pk, key], dim=-2)
+            value = torch.concat([pv, value], dim=-2)
+            cache = (key, value)
+        real_seq_len = key.shape[-2]
+
+        # (BS, n_head, seq_len, head_dim)
         query = query.view(bs, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-        key = key.view(bs, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-        value = value.view(bs, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        key = key.view(bs, real_seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        value = value.view(bs, real_seq_len, self.n_head, self.head_dim).transpose(1, 2)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(
@@ -81,14 +88,15 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             attn = (query @ key.transpose(-2, -1)) * (1.0 / math.sqrt(query.size(-1)))
-            attn = attn.masked_fill(self.bias[:, :, :seq_len, :seq_len] == 0, float("-inf"))
+            attn = attn.masked_fill(self.bias[:, :, real_seq_len - seq_len:real_seq_len, :real_seq_len] == 0,
+                                    float("-inf"))
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
             y = attn @ value
 
         y = y.transpose(1, 2).contiguous().view(bs, seq_len, self.n_embd)
         y = self.residual_dropout(self.c_proj(y))
-        return y
+        return y, cache
 
 
 class MLP(nn.Module):
@@ -117,8 +125,8 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
 
     def forward(self, x) -> torch.Tensor:
-        x = x + self.mha(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.mha(self.ln_1(x))[0] # LN + MHA
+        x = x + self.mlp(self.ln_2(x))[0] # LN + FFN
         return x
 
 
@@ -190,7 +198,7 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
-    
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0, std=0.02)
