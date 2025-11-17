@@ -277,3 +277,5 @@ if __name__ == "__main__":
 
     logits, loss = gpt2(x, y)
     print('done')
+    # for name, param in gpt2.named_parameters():
+    #     print(name, param.size())
